@@ -41,7 +41,6 @@ namespace NugetPublisherService.Services
 
             foreach (var file in Directory.EnumerateFiles(latestFolder, "*.nupkg"))
             {
-                // Обработка каждого файла
                 var match = Regex.Match(Path.GetFileName(file), @"^(.+)\.(\d+\.\d+\.\d+(-.+)?)\.nupkg$");
                 if (!match.Success)
                 {
