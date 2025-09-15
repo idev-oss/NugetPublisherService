@@ -1,6 +1,6 @@
 ﻿# NugetPublisherService
 
-[🇷🇺 Русский](README.ru.md)
+[🇷🇺 Русский](Readme.ru.md)
 
 ## Description
 
