@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+    <PropertyGroup>
+        <TargetFramework>net8.0</TargetFramework>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <UserSecretsId>dotnet-NugetPublisherService-eac91c4a-28bf-45c1-a214-3ed48bfbe1d7</UserSecretsId>
+        <ApplicationIcon>NugetPublisherService.ico</ApplicationIcon>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="MailKit" Version="4.11.0" />
+        <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.4" />
+        <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="9.0.4" />
+        <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+        <PackageReference Include="NLog.Extensions.Logging" Version="5.4.0" />
+        <PackageReference Include="NuGet.Packaging" Version="6.13.2" />
+        <PackageReference Include="NuGet.Protocol" Version="6.13.2" />
+    </ItemGroup>
+</Project>
