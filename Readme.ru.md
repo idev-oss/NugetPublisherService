@@ -1,6 +1,6 @@
 ﻿# NugetPublisherService
 
-[🇺🇸 English](README.en.md)
+[🇺🇸 English](README.md)
 
 ## Описание
 
