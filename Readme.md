@@ -1,6 +1,9 @@
 ﻿# NugetPublisherService
 
-[🇷🇺 Русский](Readme.ru.md)
+<div align="center">
+  <img src="NugetPublisherService/NugetPublisherService.ico" alt="NugetPublisherService Icon" width="64" height="64">
+</div>
+
 
 ## Description
 
@@ -67,3 +70,9 @@ The service is configured through the `appsettings.json` file with the following
 ## License
 
 This project is licensed under the terms specified in the LICENSE file.
+
+<div align="center">
+  <a href="Readme.ru.md">
+    <img src="https://img.shields.io/badge/🇷🇺-Русская_версия-success?style=flat&color=4CAF50" alt="Русская версия">
+  </a>
+</div>

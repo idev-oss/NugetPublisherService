@@ -1,6 +1,8 @@
 ﻿# NugetPublisherService
 
-[🇺🇸 English](Readme.md)
+<div align="center">
+  <img src="NugetPublisherService/NugetPublisherService.ico" alt="NugetPublisherService Icon" width="64" height="64">
+</div>
 
 ## Описание
 
@@ -65,3 +67,9 @@ NugetPublisherService - это автоматизированный сервис
 ## Лицензия
 
 Этот проект лицензирован согласно условиям, указанным в файле LICENSE.
+
+<div align="center">
+  <a href="Readme.md">
+    <img src="https://img.shields.io/badge/🇺🇸-English_version-success?style=flat&color=2196F3" alt="English version">
+  </a>
+</div>
