@@ -1,28 +1,35 @@
-# install_service.ps1
+# install_service.ps1 - PowerShell script to install Windows Service
+# Template for installing NugetPublisherService as Windows Service
+
+# Service configuration - modify paths for your environment
 $serviceName = "NugetPublisherService"
 $serviceDisplayName = "NuGet Publisher Service"
-$exePath = "C:\CI_CD\NugetPublisherService\NugetPublisherService.exe"
-$workingDir = "C:\CI_CD\NugetPublisherService"
+$exePath = "C:\Services\NugetPublisherService\NugetPublisherService.exe"
+$workingDir = "C:\Services\NugetPublisherService"
+$serviceDescription = "Automated NuGet package publishing service for GitLab NuGet Registry"
 
-Write-Host "→ Установка службы $serviceName..."
+Write-Host "→ Installing service: $serviceName..."
 
-# Проверяем, существует ли уже служба
+# Check if service already exists
 if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
-    Write-Host "⚠️ Служба $serviceName уже существует. Останавливаем и удаляем..."
+    Write-Host "⚠️ Service $serviceName already exists. Stopping and removing..."
     Stop-Service -Name $serviceName -Force
     sc.exe delete $serviceName | Out-Null
     Start-Sleep -Seconds 2
 }
 
-# Создаём службу
+# Create the service
+Write-Host "Creating service..."
 sc.exe create $serviceName binPath= "`"$exePath`"" start= auto DisplayName= "`"$serviceDisplayName`""
-sc.exe description $serviceName "Автоматическая публикация NuGet-пакетов через GitLab NuGet Registry"
+sc.exe description $serviceName "$serviceDescription"
 Start-Sleep -Seconds 1
 
-# Настройка автоматического восстановления при сбое
+# Configure automatic recovery on failure
+Write-Host "Configuring failure recovery..."
 sc.exe failure $serviceName reset= 0 actions= restart/5000
 
-# Стартуем службу
+# Start the service
+Write-Host "Starting service..."
 Start-Service -Name $serviceName
 
-Write-Host "✅ Служба $serviceName установлена и запущена."
+Write-Host "✅ Service $serviceName has been installed and started successfully."

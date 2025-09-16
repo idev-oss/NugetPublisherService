@@ -61,6 +61,8 @@ The service is configured through the `appsettings.json` file with the following
 2. Configure the `appsettings.json` file with your settings
 3. Build and run the service
 
+**Windows Service:** For production deployment, the application can be installed as a Windows Service using the provided [install_service.ps1](NugetPublisherService/install_service.ps1) script.
+
 ## Requirements
 
 - .NET 8.0
