@@ -9,7 +9,7 @@ namespace NugetPublisherService.Services
 {
     public class EmailNotifier(EmailConfig config, ILogger logger)
     {
-        public async Task SendReportAsync(List<PackageInfo> packages)
+        public async Task SendReportAsync(List<PackageInfo> packages, CancellationToken cancellationToken = default)
         {
             try
             {
@@ -17,12 +17,18 @@ namespace NugetPublisherService.Services
                 message.From.Add(MailboxAddress.Parse(config.From));
                 foreach (var to in config.To)
                     message.To.Add(MailboxAddress.Parse(to));
-                
+
                 bool hasPublishedPackages = packages.Any(p => p.PublishStatus == PublishStatus.Published);
-                string subject = hasPublishedPackages 
-                    ? "Отчет о публикации NuGet пакетов" 
-                    : "Новые NuGet пакеты для публикации";
-                
+                bool hasFailedPackages = packages.Any(p => p.PublishStatus == PublishStatus.Failed);
+
+                string subject = (hasPublishedPackages, hasFailedPackages) switch
+                {
+                    (true, true) => "Отчет о публикации NuGet пакетов (есть ошибки)",
+                    (true, false) => "Отчет о публикации NuGet пакетов",
+                    (false, true) => "Ошибка публикации NuGet пакетов",
+                    _ => "Новые NuGet пакеты для публикации"
+                };
+
                 message.Subject = subject;
 
                 var builder = new BodyBuilder();
@@ -30,16 +36,20 @@ namespace NugetPublisherService.Services
                 message.Body = builder.ToMessageBody();
 
                 using var smtp = new SmtpClient();
-                await smtp.ConnectAsync(config.Server, config.Port, config.UseSsl);
-                await smtp.AuthenticateAsync(config.Username, config.Password);
-                await smtp.SendAsync(message);
-                await smtp.DisconnectAsync(true);
+                await smtp.ConnectAsync(config.Server, config.Port, config.UseSsl, cancellationToken);
+                await smtp.AuthenticateAsync(config.Username, config.Password, cancellationToken);
+                await smtp.SendAsync(message, cancellationToken);
+                await smtp.DisconnectAsync(true, cancellationToken);
 
                 logger.LogInformation("Письмо с отчетом отправлено: {emails}", string.Join(", ", config.To));
             }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
-                logger.LogError("Ошибка при отправке письма: {msg}", ex.Message);
+                logger.LogError(ex, "Ошибка при отправке письма");
             }
         }
 
