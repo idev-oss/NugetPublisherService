@@ -47,6 +47,13 @@ namespace NugetPublisherService.Services
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
+                // Проверяем, что файл полностью записан и не заблокирован
+                if (!IsFileReady(file))
+                {
+                    logger.LogInformation("Файл ещё копируется, пропускаем: {file}", Path.GetFileName(file));
+                    continue;
+                }
+
                 var (packageId, version) = ExtractPackageMetadata(file);
                 if (packageId == null || version == null)
                 {
@@ -68,6 +75,35 @@ namespace NugetPublisherService.Services
             }
 
             return newPackages;
+        }
+
+        /// <summary>
+        /// Проверяет, что файл полностью записан и не заблокирован другим процессом
+        /// </summary>
+        private bool IsFileReady(string filePath)
+        {
+            try
+            {
+                // Пытаемся открыть файл с эксклюзивным доступом
+                using var stream = new FileStream(
+                    filePath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.None);
+
+                // Дополнительно проверяем, что файл имеет минимальный размер для .nupkg
+                return stream.Length > 0;
+            }
+            catch (IOException)
+            {
+                // Файл заблокирован - ещё копируется
+                return false;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Нет доступа к файлу
+                return false;
+            }
         }
 
         /// <summary>

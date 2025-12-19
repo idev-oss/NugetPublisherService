@@ -110,6 +110,13 @@ namespace NugetPublisherService
             }
         }
         
+        private const int MaxRetryAttempts = 3;
+        private static readonly TimeSpan[] RetryDelays = {
+            TimeSpan.FromSeconds(5),
+            TimeSpan.FromSeconds(15),
+            TimeSpan.FromSeconds(30)
+        };
+
         private async Task PushPackagesWithSdkAsync(List<PackageInfo> packages, string sourceUrl, string apiKey, CancellationToken cancellationToken)
         {
             var nugetLogger = new NuGetLogger(logger);
@@ -130,6 +137,28 @@ namespace NugetPublisherService
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
+                var published = await PushPackageWithRetryAsync(
+                    package,
+                    packageUpdateResource,
+                    timeout,
+                    apiKey,
+                    nugetLogger,
+                    cancellationToken);
+
+                package.PublishStatus = published ? PublishStatus.Published : PublishStatus.Failed;
+            }
+        }
+
+        private async Task<bool> PushPackageWithRetryAsync(
+            PackageInfo package,
+            PackageUpdateResource packageUpdateResource,
+            TimeSpan timeout,
+            string apiKey,
+            NuGetLogger nugetLogger,
+            CancellationToken cancellationToken)
+        {
+            for (int attempt = 0; attempt <= MaxRetryAttempts; attempt++)
+            {
                 try
                 {
                     await packageUpdateResource.Push(
@@ -145,15 +174,28 @@ namespace NugetPublisherService
                         allowInsecureConnections: true,
                         nugetLogger);
 
-                    package.PublishStatus = PublishStatus.Published;
                     logger.LogInformation("Успешно опубликован: {pkg}", package.FileName);
+                    return true;
+                }
+                catch (Exception ex) when (attempt < MaxRetryAttempts)
+                {
+                    var delay = RetryDelays[attempt];
+                    logger.LogWarning(ex,
+                        "Ошибка при публикации пакета {pkg}, попытка {attempt}/{max}. Повтор через {delay} сек.",
+                        package.FileName, attempt + 1, MaxRetryAttempts, delay.TotalSeconds);
+
+                    await Task.Delay(delay, cancellationToken);
                 }
                 catch (Exception ex)
                 {
-                    package.PublishStatus = PublishStatus.Failed;
-                    logger.LogError(ex, "Ошибка при публикации пакета {pkg}", package.FileName);
+                    logger.LogError(ex,
+                        "Ошибка при публикации пакета {pkg} после {attempts} попыток",
+                        package.FileName, MaxRetryAttempts + 1);
+                    return false;
                 }
             }
+
+            return false;
         }
     }
 }
