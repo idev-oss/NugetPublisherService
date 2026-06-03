@@ -1,41 +1,34 @@
-﻿using NuGet.Common;
+using NuGet.Common;
+using NugetPublisherService.Logging;
 using ILogger = Microsoft.Extensions.Logging.ILogger;
-using LogLevel = Microsoft.Extensions.Logging.LogLevel;
+using MsLogLevel = Microsoft.Extensions.Logging.LogLevel;
 using NugetLogLevel = NuGet.Common.LogLevel;
 
-public class NuGetLogger : LoggerBase
+namespace NugetPublisherService
 {
-    private readonly ILogger _logger;
-
-    public NuGetLogger(ILogger logger)
+    /// <summary>Перенаправляет сообщения NuGet SDK в Microsoft.Extensions.Logging.</summary>
+    public sealed class NuGetLogger(ILogger logger) : LoggerBase
     {
-        _logger = logger;
-    }
-
-    public override void Log(ILogMessage message)
-    {
-        switch (message.Level)
+        public override void Log(ILogMessage message)
         {
-            case NugetLogLevel.Debug:
-            case NugetLogLevel.Verbose:
-                _logger.LogDebug(message.Message);
-                break;
-            case NugetLogLevel.Information:
-            case NugetLogLevel.Minimal:
-                _logger.LogInformation(message.Message);
-                break;
-            case NugetLogLevel.Warning:
-                _logger.LogWarning(message.Message);
-                break;
-            case NugetLogLevel.Error:
-                _logger.LogError(message.Message);
-                break;
+            var level = MapLevel(message.Level);
+            var text = message.Message;
+            NugetPublisherService.Logging.Log.NuGetMessage(logger, level, text);
         }
-    }
 
-    public override Task LogAsync(ILogMessage message)
-    {
-        Log(message);
-        return Task.CompletedTask;
+        public override Task LogAsync(ILogMessage message)
+        {
+            Log(message);
+            return Task.CompletedTask;
+        }
+
+        private static MsLogLevel MapLevel(NugetLogLevel level) => level switch
+        {
+            NugetLogLevel.Debug or NugetLogLevel.Verbose => MsLogLevel.Debug,
+            NugetLogLevel.Information or NugetLogLevel.Minimal => MsLogLevel.Information,
+            NugetLogLevel.Warning => MsLogLevel.Warning,
+            NugetLogLevel.Error => MsLogLevel.Error,
+            _ => MsLogLevel.Information
+        };
     }
 }

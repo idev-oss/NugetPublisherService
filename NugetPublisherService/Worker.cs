@@ -1,24 +1,38 @@
+using NugetPublisherService.Logging;
+using NugetPublisherService.Models;
 using NugetPublisherService.Services;
 using NuGet.Configuration;
-using NuGet.Protocol.Core.Types;
 using NuGet.Protocol;
+using NuGet.Protocol.Core.Types;
 
 namespace NugetPublisherService
 {
-    public class Worker(ILogger<Worker> logger, AppSettings settings) : BackgroundService
+    public sealed class Worker(
+        ILogger<Worker> logger,
+        AppSettings settings,
+        PackageScanner scanner,
+        EmailNotifier emailNotifier,
+        PackageStateStore stateStore,
+        TimeProvider timeProvider) : BackgroundService
     {
+        private const int MaxRetryAttempts = 3;
+        private static readonly TimeSpan[] RetryDelays =
+        [
+            TimeSpan.FromSeconds(5),
+            TimeSpan.FromSeconds(15),
+            TimeSpan.FromSeconds(30)
+        ];
+
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            ValidateConfiguration();
+            await stateStore.InitializeAsync(stoppingToken);
 
-            var scanner = new PackageScanner(settings.Scan, settings.GitLab, logger);
-            var emailNotifier = new EmailNotifier(settings.Smtp, logger);
-
-            logger.LogInformation("Конфигурация успешно загружена. DryRun: {dryRun}", settings.DryRun);
+            Log.ConfigurationLoaded(logger, settings.DryRun);
 
             while (!stoppingToken.IsCancellationRequested)
             {
-                logger.LogInformation("Сканирование пакетов начато в {time}", DateTime.Now);
+                var scanStartedAt = timeProvider.GetLocalNow();
+                Log.ScanStarted(logger, scanStartedAt);
 
                 try
                 {
@@ -26,105 +40,77 @@ namespace NugetPublisherService
 
                     if (newPackages.Count > 0)
                     {
-                        logger.LogInformation("Найдено новых пакетов: {count}", newPackages.Count);
+                        Log.NewPackagesFound(logger, newPackages.Count);
 
-                        if (!settings.DryRun)
+                        if (settings.DryRun)
                         {
-                            string sourceUrl = $"{settings.GitLab.BaseUrl}/projects/{settings.GitLab.ProjectId}/packages/nuget/index.json";
-                            string apiKey = settings.GitLab.PrivateToken;
+                            foreach (var package in newPackages)
+                            {
+                                package.PublishStatus = PublishStatus.Skipped;
+                            }
+                        }
+                        else
+                        {
+                            var sourceUrl = $"{settings.GitLab.BaseUrl}/projects/{settings.GitLab.ProjectId}/packages/nuget/index.json";
+                            await PushPackagesWithSdkAsync(newPackages, sourceUrl, settings.GitLab.PrivateToken, stoppingToken);
+                        }
 
-                            await PushPackagesWithSdkAsync(newPackages, sourceUrl, apiKey, stoppingToken);
+                        foreach (var package in newPackages)
+                        {
+                            await stateStore.SaveAsync(package, timeProvider.GetUtcNow().UtcDateTime, stoppingToken);
                         }
 
                         await emailNotifier.SendReportAsync(newPackages, stoppingToken);
                     }
                     else
                     {
-                        logger.LogInformation("Новых пакетов не найдено. Ожидание следующего цикла сканирования.");
+                        Log.NoNewPackages(logger);
                     }
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                 {
-                    logger.LogInformation("Сканирование отменено по запросу остановки сервиса.");
+                    Log.ScanCancelled(logger);
                     break;
                 }
                 catch (Exception ex)
                 {
-                    logger.LogError(ex, "Ошибка во время сканирования или отправки email.");
+                    Log.ScanError(logger, ex);
                 }
 
-                await Task.Delay(GetDelayInterval(), stoppingToken);
+                try
+                {
+                    await Task.Delay(GetDelayInterval(), stoppingToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
             }
         }
-        
+
+        /// <summary>
+        /// В рабочие дни (Пн–Пт) в рабочие часы используется ScanIntervalMinutes,
+        /// в остальное время — OffHoursIntervalHours.
+        /// </summary>
         private TimeSpan GetDelayInterval()
         {
-            var now = DateTime.Now;
-            bool isWorkingDay = now.DayOfWeek != DayOfWeek.Saturday && now.DayOfWeek != DayOfWeek.Sunday;
-            bool isWorkingHours = now.Hour >= 9 && now.Hour < 21;
-    
-            // В рабочие дни с 9:00 до 21:00 - интервал 20 минут
-            if (isWorkingDay && isWorkingHours)
-            {
-                return TimeSpan.FromMinutes(settings.Scan.ScanIntervalMinutes);
-            }
-            // В остальное время - интервал 2 часа
-            return TimeSpan.FromHours(2);
+            var now = timeProvider.GetLocalNow();
+            var scan = settings.Scan;
+
+            var isWorkingDay = now.DayOfWeek is not (DayOfWeek.Saturday or DayOfWeek.Sunday);
+            var isWorkingHours = now.Hour >= scan.WorkingHourStart && now.Hour < scan.WorkingHourEnd;
+
+            return isWorkingDay && isWorkingHours
+                ? TimeSpan.FromMinutes(scan.ScanIntervalMinutes)
+                : TimeSpan.FromHours(scan.OffHoursIntervalHours);
         }
 
-        private void ValidateConfiguration()
-        {
-            var errors = new List<string>();
-
-            if (string.IsNullOrWhiteSpace(settings.Scan.BasePath))
-                errors.Add("Scan.BasePath не может быть пустым");
-
-            if (!Directory.Exists(settings.Scan.BasePath))
-                errors.Add($"Scan.BasePath директория не существует: {settings.Scan.BasePath}");
-
-            if (string.IsNullOrWhiteSpace(settings.Scan.PathPatternRegex))
-                errors.Add("Scan.PathPatternRegex не может быть пустым");
-
-            if (string.IsNullOrWhiteSpace(settings.GitLab.BaseUrl))
-                errors.Add("GitLab.BaseUrl не может быть пустым");
-
-            if (!Uri.TryCreate(settings.GitLab.BaseUrl, UriKind.Absolute, out _))
-                errors.Add($"GitLab.BaseUrl имеет некорректный формат URL: {settings.GitLab.BaseUrl}");
-
-            if (string.IsNullOrWhiteSpace(settings.GitLab.PrivateToken))
-                errors.Add("GitLab.PrivateToken не может быть пустым");
-
-            if (string.IsNullOrWhiteSpace(settings.Smtp.Server))
-                errors.Add("Smtp.Server не может быть пустым");
-
-            if (settings.Smtp.To == null || settings.Smtp.To.Length == 0)
-                errors.Add("Smtp.To должен содержать хотя бы один email адрес");
-
-            if (errors.Count > 0)
-            {
-                foreach (var error in errors)
-                {
-                    logger.LogError("Ошибка конфигурации: {error}", error);
-                }
-                throw new InvalidOperationException($"Обнаружены ошибки конфигурации: {string.Join("; ", errors)}");
-            }
-        }
-        
-        private const int MaxRetryAttempts = 3;
-        private static readonly TimeSpan[] RetryDelays = {
-            TimeSpan.FromSeconds(5),
-            TimeSpan.FromSeconds(15),
-            TimeSpan.FromSeconds(30)
-        };
-
-        private async Task PushPackagesWithSdkAsync(List<PackageInfo> packages, string sourceUrl, string apiKey, CancellationToken cancellationToken)
+        private async Task PushPackagesWithSdkAsync(
+            List<PackageInfo> packages, string sourceUrl, string apiKey, CancellationToken cancellationToken)
         {
             var nugetLogger = new NuGetLogger(logger);
 
-            var packageSource = new PackageSource(sourceUrl)
-            {
-                ProtocolVersion = 3
-            };
+            var packageSource = new PackageSource(sourceUrl) { ProtocolVersion = 3 };
 
             var packageUpdateResource = await Repository.Factory
                 .GetCoreV3(packageSource)
@@ -132,18 +118,13 @@ namespace NugetPublisherService
 
             var timeout = TimeSpan.FromSeconds(30);
 
-            // Публикуем пакеты по одному для корректной обработки ошибок
+            // Публикуем пакеты по одному для корректной обработки ошибок.
             foreach (var package in packages)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
                 var published = await PushPackageWithRetryAsync(
-                    package,
-                    packageUpdateResource,
-                    timeout,
-                    apiKey,
-                    nugetLogger,
-                    cancellationToken);
+                    package, packageUpdateResource, timeout, apiKey, nugetLogger, cancellationToken);
 
                 package.PublishStatus = published ? PublishStatus.Published : PublishStatus.Failed;
             }
@@ -157,12 +138,12 @@ namespace NugetPublisherService
             NuGetLogger nugetLogger,
             CancellationToken cancellationToken)
         {
-            for (int attempt = 0; attempt <= MaxRetryAttempts; attempt++)
+            for (var attempt = 0; attempt <= MaxRetryAttempts; attempt++)
             {
                 try
                 {
                     await packageUpdateResource.Push(
-                        new[] { package.FullPath },
+                        [package.FullPath],
                         symbolSource: null,
                         timeoutInSecond: (int)timeout.TotalSeconds,
                         disableBuffering: false,
@@ -174,23 +155,18 @@ namespace NugetPublisherService
                         allowInsecureConnections: true,
                         nugetLogger);
 
-                    logger.LogInformation("Успешно опубликован: {pkg}", package.FileName);
+                    Log.PackagePublished(logger, package.FileName);
                     return true;
                 }
                 catch (Exception ex) when (attempt < MaxRetryAttempts)
                 {
                     var delay = RetryDelays[attempt];
-                    logger.LogWarning(ex,
-                        "Ошибка при публикации пакета {pkg}, попытка {attempt}/{max}. Повтор через {delay} сек.",
-                        package.FileName, attempt + 1, MaxRetryAttempts, delay.TotalSeconds);
-
+                    Log.PackagePublishRetry(logger, package.FileName, attempt + 1, MaxRetryAttempts, delay.TotalSeconds, ex);
                     await Task.Delay(delay, cancellationToken);
                 }
                 catch (Exception ex)
                 {
-                    logger.LogError(ex,
-                        "Ошибка при публикации пакета {pkg} после {attempts} попыток",
-                        package.FileName, MaxRetryAttempts + 1);
+                    Log.PackagePublishFailed(logger, package.FileName, MaxRetryAttempts + 1, ex);
                     return false;
                 }
             }
