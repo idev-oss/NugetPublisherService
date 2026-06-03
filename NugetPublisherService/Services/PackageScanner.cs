@@ -1,76 +1,104 @@
-﻿using System.Text.RegularExpressions;
+using System.Globalization;
+using System.Text.RegularExpressions;
 using NuGet.Configuration;
 using NuGet.Packaging;
 using NuGet.Protocol;
 using NuGet.Protocol.Core.Types;
-using NugetPublisherService.Models;
 using NuGet.Versioning;
+using NugetPublisherService.Logging;
+using NugetPublisherService.Models;
 
 namespace NugetPublisherService.Services
 {
-    public class PackageInfo
+    /// <summary>
+    /// Поиск новых .nupkg на сетевой шаре. Вместо рекурсивного обхода всего дерева
+    /// строит пути напрямую по настраиваемой структуре BasePath\{год}\{дата}\{leaf}
+    /// и сканирует только окно последних дней. Уже обработанные пакеты отсеиваются
+    /// через локальный SQLite-кэш.
+    /// </summary>
+    public sealed partial class PackageScanner(
+        ScanConfig scanConfig,
+        GitLabConfig gitLabConfig,
+        PackageStateStore stateStore,
+        TimeProvider timeProvider,
+        ILogger<PackageScanner> logger)
     {
-        public required string FileName { get; set; }
-        public required string PackageId { get; set; }
-        public required string Version { get; set; }
-        public required string FullPath { get; set; }
-        public required PublishStatus PublishStatus { get; set; }
-    }
-
-    public enum PublishStatus
-    {
-        Published,
-        Failed
-    }
-
-    public class PackageScanner(ScanConfig scanConfig, GitLabConfig gitLabConfig, ILogger logger)
-    {
-        private readonly Regex _nugetPathPattern = new(
-            scanConfig.PathPatternRegex,
-            RegexOptions.IgnoreCase | RegexOptions.Compiled
-        );
+        private FindPackageByIdResource? _findResource;
 
         public async Task<List<PackageInfo>> FindNewPackagesAsync(CancellationToken cancellationToken = default)
         {
             var newPackages = new List<PackageInfo>();
-            var latestFolder = FindLatestNugetSourceFolder();
 
-            if (latestFolder == null)
+            var folders = EnumerateCandidateFolders();
+            if (folders.Count == 0)
             {
-                logger.LogWarning("Не найдена подходящая папка NugetSource.");
+                Log.NoCandidateFolders(logger, scanConfig.LookbackDays);
                 return newPackages;
             }
 
-            logger.LogInformation("Сканирование папки: {folder}", latestFolder);
-
-            foreach (var file in Directory.EnumerateFiles(latestFolder, "*.nupkg"))
+            foreach (var folder in folders)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                Log.ScanningFolder(logger, folder);
 
-                // Проверяем, что файл полностью записан и не заблокирован
-                if (!IsFileReady(file))
+                foreach (var file in Directory.EnumerateFiles(folder, "*.nupkg"))
                 {
-                    logger.LogInformation("Файл ещё копируется, пропускаем: {file}", Path.GetFileName(file));
-                    continue;
-                }
+                    cancellationToken.ThrowIfCancellationRequested();
 
-                var (packageId, version) = ExtractPackageMetadata(file);
-                if (packageId == null || version == null)
-                {
-                    logger.LogWarning("Не удалось извлечь метаданные пакета: {file}", Path.GetFileName(file));
-                    continue;
-                }
+                    var fileInfo = new FileInfo(file);
 
-                if (!await IsPackagePublishedAsync(packageId, version, cancellationToken))
-                {
-                    newPackages.Add(new PackageInfo
+                    // Файл ещё копируется или заблокирован — пропускаем до следующего цикла.
+                    if (!IsFileReady(file))
                     {
-                        FileName = Path.GetFileName(file),
+                        Log.FileNotReady(logger, fileInfo.Name);
+                        continue;
+                    }
+
+                    // Быстрый отсев по идентичности файла (без чтения .nupkg и без сети).
+                    if (await stateStore.IsFilePublishedAsync(
+                            file, fileInfo.Length, fileInfo.LastWriteTimeUtc, cancellationToken))
+                    {
+                        Log.FileSkippedByCache(logger, fileInfo.Name);
+                        continue;
+                    }
+
+                    var (packageId, version) = ExtractPackageMetadata(file);
+                    if (packageId is null || version is null)
+                    {
+                        Log.MetadataExtractFailed(logger, fileInfo.Name);
+                        continue;
+                    }
+
+                    var package = new PackageInfo
+                    {
+                        FileName = fileInfo.Name,
                         PackageId = packageId,
                         Version = version,
                         FullPath = file,
-                        PublishStatus = PublishStatus.Failed
-                    });
+                        FileSize = fileInfo.Length,
+                        FileWriteTimeUtc = fileInfo.LastWriteTimeUtc,
+                        PublishStatus = PublishStatus.Pending
+                    };
+
+                    // Тот же пакет уже отмечен опубликованным (возможно, из другой папки) —
+                    // обновляем идентичность файла в кэше и пропускаем.
+                    if (await stateStore.IsPackagePublishedAsync(packageId, version, cancellationToken))
+                    {
+                        package.PublishStatus = PublishStatus.Published;
+                        await stateStore.SaveAsync(package, timeProvider.GetUtcNow().UtcDateTime, cancellationToken);
+                        continue;
+                    }
+
+                    // Незнакомый кэшу пакет — разовая проверка в GitLab, чтобы засеять кэш
+                    // без повторной публикации уже существующих пакетов.
+                    if (await IsPublishedInGitLabAsync(packageId, version, cancellationToken))
+                    {
+                        package.PublishStatus = PublishStatus.Published;
+                        await stateStore.SaveAsync(package, timeProvider.GetUtcNow().UtcDateTime, cancellationToken);
+                        continue;
+                    }
+
+                    newPackages.Add(package);
                 }
             }
 
@@ -78,37 +106,113 @@ namespace NugetPublisherService.Services
         }
 
         /// <summary>
-        /// Проверяет, что файл полностью записан и не заблокирован другим процессом
+        /// Строит список папок-кандидатов прямым обходом известной структуры,
+        /// без рекурсии по всему дереву. Возвращает только существующие leaf-папки
+        /// для дат в окне [today - LookbackDays; today].
         /// </summary>
-        private bool IsFileReady(string filePath)
+        private List<string> EnumerateCandidateFolders()
+        {
+            var result = new List<string>();
+
+            if (!Directory.Exists(scanConfig.BasePath))
+            {
+                Log.BasePathUnavailable(logger, scanConfig.BasePath);
+                return result;
+            }
+
+            var today = DateOnly.FromDateTime(timeProvider.GetLocalNow().DateTime);
+            var windowStart = today.AddDays(-scanConfig.LookbackDays);
+
+            var startYear = scanConfig.IncludePreviousYearFolder ? windowStart.Year : today.Year;
+            for (var year = startYear; year <= today.Year; year++)
+            {
+                AddCandidateFoldersForYear(result, year, today, windowStart);
+            }
+
+            return result
+                .OrderByDescending(SafeLastWriteTime)
+                .ToList();
+        }
+
+        private void AddCandidateFoldersForYear(List<string> result, int year, DateOnly today, DateOnly windowStart)
+        {
+            var yearFolderName = new DateTime(year, 1, 1).ToString(scanConfig.YearFolderFormat, CultureInfo.InvariantCulture);
+            var yearPath = Path.Combine(scanConfig.BasePath, yearFolderName);
+
+            if (!Directory.Exists(yearPath))
+            {
+                return;
+            }
+
+            IEnumerable<string> dateDirectories;
+            try
+            {
+                dateDirectories = Directory.EnumerateDirectories(yearPath, "*", SearchOption.TopDirectoryOnly);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                Log.DirectoryAccessDenied(logger, yearPath, ex);
+                return;
+            }
+            catch (IOException ex)
+            {
+                Log.FolderEnumerationError(logger, yearPath, ex);
+                return;
+            }
+
+            foreach (var dateDir in dateDirectories)
+            {
+                var name = Path.GetFileName(dateDir);
+                if (!DateOnly.TryParseExact(name, scanConfig.DateFolderFormat,
+                        CultureInfo.InvariantCulture, DateTimeStyles.None, out var folderDate))
+                {
+                    continue;
+                }
+
+                if (folderDate < windowStart || folderDate > today)
+                {
+                    continue;
+                }
+
+                var leaf = Path.Combine(dateDir, scanConfig.LeafRelativePath);
+                if (Directory.Exists(leaf))
+                {
+                    result.Add(leaf);
+                }
+            }
+        }
+
+        private static DateTime SafeLastWriteTime(string path)
         {
             try
             {
-                // Пытаемся открыть файл с эксклюзивным доступом
-                using var stream = new FileStream(
-                    filePath,
-                    FileMode.Open,
-                    FileAccess.Read,
-                    FileShare.None);
+                return Directory.GetLastWriteTimeUtc(path);
+            }
+            catch (IOException)
+            {
+                return DateTime.MinValue;
+            }
+        }
 
-                // Дополнительно проверяем, что файл имеет минимальный размер для .nupkg
+        /// <summary>Проверяет, что файл полностью записан и не заблокирован другим процессом.</summary>
+        private static bool IsFileReady(string filePath)
+        {
+            try
+            {
+                using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.None);
                 return stream.Length > 0;
             }
             catch (IOException)
             {
-                // Файл заблокирован - ещё копируется
                 return false;
             }
             catch (UnauthorizedAccessException)
             {
-                // Нет доступа к файлу
                 return false;
             }
         }
 
-        /// <summary>
-        /// Извлекает метаданные пакета используя NuGet.Packaging для надёжного парсинга
-        /// </summary>
+        /// <summary>Извлекает (Id, Version) пакета через NuGet.Packaging с fallback на парсинг имени файла.</summary>
         private (string? PackageId, string? Version) ExtractPackageMetadata(string filePath)
         {
             try
@@ -119,11 +223,9 @@ namespace NugetPublisherService.Services
             }
             catch (Exception ex)
             {
-                logger.LogWarning(ex, "Ошибка чтения метаданных пакета {file}, попытка парсинга имени файла",
-                    Path.GetFileName(filePath));
+                Log.MetadataReadError(logger, Path.GetFileName(filePath), ex);
 
-                // Fallback: парсинг имени файла
-                var match = Regex.Match(Path.GetFileName(filePath), @"^(.+?)\.(\d+\.\d+\.\d+[^.]*)\.nupkg$");
+                var match = PackageFileNameRegex().Match(Path.GetFileName(filePath));
                 if (match.Success)
                 {
                     return (match.Groups[1].Value, match.Groups[2].Value);
@@ -133,68 +235,11 @@ namespace NugetPublisherService.Services
             }
         }
 
-        private string? FindLatestNugetSourceFolder()
+        private async Task<bool> IsPublishedInGitLabAsync(string packageId, string version, CancellationToken cancellationToken)
         {
             try
             {
-                var directories = new List<string>();
-
-                try
-                {
-                    foreach (var dir in Directory.EnumerateDirectories(scanConfig.BasePath, "*", SearchOption.AllDirectories))
-                    {
-                        try
-                        {
-                            if (_nugetPathPattern.IsMatch(dir))
-                            {
-                                directories.Add(dir);
-                            }
-                        }
-                        catch (UnauthorizedAccessException)
-                        {
-                            // Пропускаем директории без доступа
-                        }
-                    }
-                }
-                catch (UnauthorizedAccessException ex)
-                {
-                    logger.LogWarning(ex, "Нет доступа к некоторым директориям в {path}", scanConfig.BasePath);
-                }
-
-                return directories
-                    .OrderByDescending(p => Directory.GetLastWriteTime(p))
-                    .FirstOrDefault();
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Ошибка при поиске директорий в {path}", scanConfig.BasePath);
-                return null;
-            }
-        }
-
-        private async Task<bool> IsPackagePublishedAsync(string packageId, string version, CancellationToken cancellationToken)
-        {
-            try
-            {
-                var nugetLogger = new NuGetLogger(logger);
-
-                var packageSource =
-                    new PackageSource(
-                        $"{gitLabConfig.BaseUrl}/projects/{gitLabConfig.ProjectId}/packages/nuget/index.json")
-                    {
-                        ProtocolVersion = 3
-                    };
-
-                packageSource.Credentials = PackageSourceCredential.FromUserInput(
-                    source: packageSource.Source,
-                    username: "gitlab",
-                    password: gitLabConfig.PrivateToken,
-                    storePasswordInClearText: true,
-                    validAuthenticationTypesText: null
-                );
-
-                var repository = Repository.Factory.GetCoreV3(packageSource);
-                var resource = await repository.GetResourceAsync<FindPackageByIdResource>(cancellationToken);
+                var resource = await GetFindResourceAsync(cancellationToken);
                 var nugetVersion = new NuGetVersion(version);
 
                 using var cache = new SourceCacheContext
@@ -205,18 +250,40 @@ namespace NugetPublisherService.Services
                 };
 
                 return await resource.DoesPackageExistAsync(
-                    packageId,
-                    nugetVersion,
-                    cache,
-                    nugetLogger,
-                    cancellationToken
-                );
+                    packageId, nugetVersion, cache, new NuGetLogger(logger), cancellationToken);
             }
             catch (Exception ex)
             {
-                logger.LogError(ex, "Ошибка при проверке публикации пакета {pkg} v{version}", packageId, version);
+                Log.PackageCheckError(logger, packageId, version, ex);
                 return false;
             }
         }
+
+        private async Task<FindPackageByIdResource> GetFindResourceAsync(CancellationToken cancellationToken)
+        {
+            if (_findResource is not null)
+            {
+                return _findResource;
+            }
+
+            var packageSource = new PackageSource(
+                $"{gitLabConfig.BaseUrl}/projects/{gitLabConfig.ProjectId}/packages/nuget/index.json")
+            {
+                ProtocolVersion = 3,
+                Credentials = PackageSourceCredential.FromUserInput(
+                    source: $"{gitLabConfig.BaseUrl}/projects/{gitLabConfig.ProjectId}/packages/nuget/index.json",
+                    username: "gitlab",
+                    password: gitLabConfig.PrivateToken,
+                    storePasswordInClearText: true,
+                    validAuthenticationTypesText: null)
+            };
+
+            var repository = Repository.Factory.GetCoreV3(packageSource);
+            _findResource = await repository.GetResourceAsync<FindPackageByIdResource>(cancellationToken);
+            return _findResource;
+        }
+
+        [GeneratedRegex(@"^(.+?)\.(\d+\.\d+\.\d+[^.]*)\.nupkg$")]
+        private static partial Regex PackageFileNameRegex();
     }
 }

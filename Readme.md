@@ -11,50 +11,65 @@ NugetPublisherService is an automated service for publishing NuGet packages to a
 
 ## Key Features
 
-- **Automatic scanning**: Regular search for new NuGet packages in specified directories
-- **Smart scheduling**: Different scanning intervals for business and non-business hours
+- **Fast targeted scanning**: Direct traversal of the known folder structure (`year → date → leaf`) instead of recursing the whole share; only a window of recent days is processed
+- **Local SQLite cache**: Already-processed packages are skipped without reading the `.nupkg` or calling GitLab; dedup survives service restarts
+- **Smart scheduling**: Different, configurable scanning intervals for business and non-business hours
 - **Duplicate checking**: Prevention of repeated publications of already existing packages
-- **Email notifications**: Automatic sending of publication reports via email
+- **Email notifications**: Reports with three statuses (Published / Failed / Skipped in DryRun)
 - **Dry Run mode**: Ability to test service operation without actual package publication
 
 ## How It Works
 
-1. The service scans specified directories for .nupkg files
-2. Checks if each package has already been published to the GitLab repository
-3. Publishes new packages through NuGet API
-4. Sends email report about publication results
+1. The service builds paths directly from the `BasePath\{year}\{date}\{leaf}` structure and scans only date folders within the `LookbackDays` window
+2. Each `.nupkg` is checked against the local SQLite cache; already published ones are skipped
+3. Packages unknown to the cache are checked once against GitLab (cache seeding); new ones are published through the NuGet API
+4. Sends an email report about publication results
 
 ## Configuration
 
-The service is configured through the `appsettings.json` file with the following parameters:
+The service is configured through `appsettings.json`. A documented template is available at [appsettings.example.json](NugetPublisherService/appsettings.example.json).
 
-```json
+```jsonc
 {
   "Scan": {
-    "BasePath": "path/to/packages/directory",
-    "PathPatternRegex": "regex_pattern_for_directory_search",
-    "ScanIntervalMinutes": 20
+    "BasePath": "\\\\nas\\app\\update",   // root folder (network share)
+    "YearFolderFormat": "_yyyy",            // year folder name: _2026
+    "DateFolderFormat": "yyyy-MM-dd",       // date folder name: 2026-05-18
+    "LeafRelativePath": "Refactor\\NugetSource", // subpath to the .nupkg files
+    "LookbackDays": 60,                     // scan window (previous + current month)
+    "IncludePreviousYearFolder": true,      // include previous year at year boundary (January)
+    "ScanIntervalMinutes": 10,              // interval during working hours
+    "WorkingHourStart": 9,                  // working hours start
+    "WorkingHourEnd": 21,                   // working hours end
+    "OffHoursIntervalHours": 2              // interval off-hours and on weekends
   },
   "GitLab": {
-    "BaseUrl": "https://gitlab.example.com/api/v4",
-    "ProjectId": "project_identifier",
+    "BaseUrl": "http://git.example.local/api/v4",
+    "ProjectId": 11,
     "PrivateToken": "access_token"
   },
   "Smtp": {
     "Server": "smtp.example.com",
-    "Port": 587,
+    "Port": 465,
     "UseSsl": true,
     "Username": "username",
     "Password": "password",
     "From": "sender@example.com",
-    "To": [
-      "recipient1@example.com",
-      "recipient2@example.com"
-    ]
+    "To": ["recipient1@example.com", "recipient2@example.com"]
+  },
+  "State": {
+    "DatabasePath": "Data\\state.db"        // local SQLite cache file
   },
   "DryRun": false
 }
 ```
+
+> Resulting scan path: `BasePath\_2026\2026-05-18\Refactor\NugetSource\*.nupkg`.
+> The folder structure is configurable via `YearFolderFormat` / `DateFolderFormat` / `LeafRelativePath`.
+
+Configuration is validated at startup (fail-fast): with invalid values the service won't start and
+prints a clear error. The existence of the network `BasePath` is checked at runtime so a temporarily
+unavailable share does not crash the service.
 ## Installation
 
 1. Clone the repository
@@ -65,7 +80,7 @@ The service is configured through the `appsettings.json` file with the following
 
 ## Requirements
 
-- .NET 8.0
+- .NET 10.0
 - Access to GitLab repository with NuGet package registry
 - SMTP server for email notifications (optional)
 
