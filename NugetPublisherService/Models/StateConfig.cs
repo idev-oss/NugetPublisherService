@@ -8,7 +8,9 @@ namespace NugetPublisherService.Models
     public class StateConfig
     {
         /// <summary>
-        /// Путь к файлу базы SQLite. Относительный путь разрешается от рабочего каталога сервиса.
+        /// Путь к файлу базы SQLite. Относительный путь разрешается от каталога приложения
+        /// (рядом с .exe), а не от текущего рабочего каталога (у службы это C:\Windows\system32).
+        /// Можно указать абсолютный путь, например C:\ProgramData\NugetPublisherService\state.db.
         /// По умолчанию "Data\state.db".
         /// </summary>
         [Required(AllowEmptyStrings = false)]

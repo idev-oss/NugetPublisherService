@@ -18,7 +18,13 @@ namespace NugetPublisherService.Services
 
         private static string BuildConnectionString(string databasePath)
         {
-            var fullPath = Path.GetFullPath(databasePath);
+            // Относительный путь резолвим от каталога приложения (рядом с .exe),
+            // а НЕ от текущего рабочего каталога: у Windows-службы CWD = C:\Windows\system32.
+            var fullPath = Path.IsPathRooted(databasePath)
+                ? databasePath
+                : Path.Combine(AppContext.BaseDirectory, databasePath);
+            fullPath = Path.GetFullPath(fullPath);
+
             var directory = Path.GetDirectoryName(fullPath);
             if (!string.IsNullOrEmpty(directory))
             {
