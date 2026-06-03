@@ -1,18 +1,20 @@
-using Newtonsoft.Json;
 using NugetPublisherService.Services;
 using NuGet.Configuration;
 using NuGet.Protocol.Core.Types;
 using NuGet.Protocol;
+
 namespace NugetPublisherService
 {
     public class Worker(ILogger<Worker> logger, AppSettings settings) : BackgroundService
     {
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            LoadConfigs();
+            ValidateConfiguration();
 
             var scanner = new PackageScanner(settings.Scan, settings.GitLab, logger);
             var emailNotifier = new EmailNotifier(settings.Smtp, logger);
+
+            logger.LogInformation("Конфигурация успешно загружена. DryRun: {dryRun}", settings.DryRun);
 
             while (!stoppingToken.IsCancellationRequested)
             {
@@ -20,7 +22,7 @@ namespace NugetPublisherService
 
                 try
                 {
-                    var newPackages = await scanner.FindNewPackagesAsync();
+                    var newPackages = await scanner.FindNewPackagesAsync(stoppingToken);
 
                     if (newPackages.Count > 0)
                     {
@@ -30,17 +32,21 @@ namespace NugetPublisherService
                         {
                             string sourceUrl = $"{settings.GitLab.BaseUrl}/projects/{settings.GitLab.ProjectId}/packages/nuget/index.json";
                             string apiKey = settings.GitLab.PrivateToken;
-                            
-                            // Публикуем все пакеты за один вызов
-                            await PushPackagesWithSdkAsync(newPackages, sourceUrl, apiKey);
+
+                            await PushPackagesWithSdkAsync(newPackages, sourceUrl, apiKey, stoppingToken);
                         }
-                        
-                        await emailNotifier.SendReportAsync(newPackages);
+
+                        await emailNotifier.SendReportAsync(newPackages, stoppingToken);
                     }
                     else
                     {
                         logger.LogInformation("Новых пакетов не найдено. Ожидание следующего цикла сканирования.");
                     }
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    logger.LogInformation("Сканирование отменено по запросу остановки сервиса.");
+                    break;
                 }
                 catch (Exception ex)
                 {
@@ -66,74 +72,130 @@ namespace NugetPublisherService
             return TimeSpan.FromHours(2);
         }
 
-        private void LoadConfigs()
+        private void ValidateConfiguration()
         {
-            string configPath = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
+            var errors = new List<string>();
 
-            if (!File.Exists(configPath))
+            if (string.IsNullOrWhiteSpace(settings.Scan.BasePath))
+                errors.Add("Scan.BasePath не может быть пустым");
+
+            if (!Directory.Exists(settings.Scan.BasePath))
+                errors.Add($"Scan.BasePath директория не существует: {settings.Scan.BasePath}");
+
+            if (string.IsNullOrWhiteSpace(settings.Scan.PathPatternRegex))
+                errors.Add("Scan.PathPatternRegex не может быть пустым");
+
+            if (string.IsNullOrWhiteSpace(settings.GitLab.BaseUrl))
+                errors.Add("GitLab.BaseUrl не может быть пустым");
+
+            if (!Uri.TryCreate(settings.GitLab.BaseUrl, UriKind.Absolute, out _))
+                errors.Add($"GitLab.BaseUrl имеет некорректный формат URL: {settings.GitLab.BaseUrl}");
+
+            if (string.IsNullOrWhiteSpace(settings.GitLab.PrivateToken))
+                errors.Add("GitLab.PrivateToken не может быть пустым");
+
+            if (string.IsNullOrWhiteSpace(settings.Smtp.Server))
+                errors.Add("Smtp.Server не может быть пустым");
+
+            if (settings.Smtp.To == null || settings.Smtp.To.Length == 0)
+                errors.Add("Smtp.To должен содержать хотя бы один email адрес");
+
+            if (errors.Count > 0)
             {
-                logger.LogError("Файл конфигурации не найден: {path}", configPath);
-                throw new FileNotFoundException("appsettings.json не найден", configPath);
+                foreach (var error in errors)
+                {
+                    logger.LogError("Ошибка конфигурации: {error}", error);
+                }
+                throw new InvalidOperationException($"Обнаружены ошибки конфигурации: {string.Join("; ", errors)}");
             }
-
-            var configJson = File.ReadAllText(configPath);
-            settings = JsonConvert.DeserializeObject<AppSettings>(configJson)
-                       ?? throw new InvalidOperationException("Ошибка десериализации конфигурации");
-
-            logger.LogInformation("Конфигурация успешно загружена. DryRun: {dryRun}", settings.DryRun);
         }
         
-        private async Task PushPackagesWithSdkAsync(List<PackageInfo> packages, string sourceUrl, string apiKey)
+        private const int MaxRetryAttempts = 3;
+        private static readonly TimeSpan[] RetryDelays = {
+            TimeSpan.FromSeconds(5),
+            TimeSpan.FromSeconds(15),
+            TimeSpan.FromSeconds(30)
+        };
+
+        private async Task PushPackagesWithSdkAsync(List<PackageInfo> packages, string sourceUrl, string apiKey, CancellationToken cancellationToken)
         {
-            var packagePaths = packages.Select(p => p.FullPath).ToList();
+            var nugetLogger = new NuGetLogger(logger);
 
-            try
+            var packageSource = new PackageSource(sourceUrl)
             {
-                var logger1 = new NuGetLogger(logger);
+                ProtocolVersion = 3
+            };
 
-                var packageSource = new PackageSource(sourceUrl)
+            var packageUpdateResource = await Repository.Factory
+                .GetCoreV3(packageSource)
+                .GetResourceAsync<PackageUpdateResource>(cancellationToken);
+
+            var timeout = TimeSpan.FromSeconds(30);
+
+            // Публикуем пакеты по одному для корректной обработки ошибок
+            foreach (var package in packages)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var published = await PushPackageWithRetryAsync(
+                    package,
+                    packageUpdateResource,
+                    timeout,
+                    apiKey,
+                    nugetLogger,
+                    cancellationToken);
+
+                package.PublishStatus = published ? PublishStatus.Published : PublishStatus.Failed;
+            }
+        }
+
+        private async Task<bool> PushPackageWithRetryAsync(
+            PackageInfo package,
+            PackageUpdateResource packageUpdateResource,
+            TimeSpan timeout,
+            string apiKey,
+            NuGetLogger nugetLogger,
+            CancellationToken cancellationToken)
+        {
+            for (int attempt = 0; attempt <= MaxRetryAttempts; attempt++)
+            {
+                try
                 {
-                    ProtocolVersion = 3
-                };
+                    await packageUpdateResource.Push(
+                        new[] { package.FullPath },
+                        symbolSource: null,
+                        timeoutInSecond: (int)timeout.TotalSeconds,
+                        disableBuffering: false,
+                        getApiKey: _ => apiKey,
+                        getSymbolApiKey: _ => null,
+                        noServiceEndpoint: false,
+                        skipDuplicate: true,
+                        symbolPackageUpdateResource: null,
+                        allowInsecureConnections: true,
+                        nugetLogger);
 
-                var repository = NullSettings.Instance;
-                var packageUpdateResource = await Repository.Factory
-                    .GetCoreV3(packageSource)
-                    .GetResourceAsync<PackageUpdateResource>();
-
-                var timeout = TimeSpan.FromSeconds(30);
-
-                // Используем перегрузку метода Push с поддержкой множественных путей
-                await packageUpdateResource.Push(
-                    packagePaths,
-                    symbolSource: null,
-                    timeoutInSecond: (int)timeout.TotalSeconds,
-                    disableBuffering: false,
-                    getApiKey: _ => apiKey,
-                    getSymbolApiKey: _ => null,
-                    noServiceEndpoint: false,
-                    skipDuplicate: true,
-                    symbolPackageUpdateResource: null,
-                    allowInsecureConnections: true,
-                    logger1);
-
-                // Отмечаем все пакеты как успешно опубликованные
-                foreach (var package in packages)
+                    logger.LogInformation("Успешно опубликован: {pkg}", package.FileName);
+                    return true;
+                }
+                catch (Exception ex) when (attempt < MaxRetryAttempts)
                 {
-                    string fileName = Path.GetFileName(package.FullPath);
-                    logger.LogInformation("Успешно опубликован через NuGet SDK: {pkg}", fileName);
-                    
-                    package.PublishStatus = PublishStatus.Published;
+                    var delay = RetryDelays[attempt];
+                    logger.LogWarning(ex,
+                        "Ошибка при публикации пакета {pkg}, попытка {attempt}/{max}. Повтор через {delay} сек.",
+                        package.FileName, attempt + 1, MaxRetryAttempts, delay.TotalSeconds);
+
+                    await Task.Delay(delay, cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex,
+                        "Ошибка при публикации пакета {pkg} после {attempts} попыток",
+                        package.FileName, MaxRetryAttempts + 1);
+                    return false;
                 }
             }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Ошибка при публикации нескольких пакетов через SDK");
-                foreach (var package in packages)
-                {
-                    package.PublishStatus = PublishStatus.Failed;
-                }
-            }
+
+            return false;
         }
     }
 }
