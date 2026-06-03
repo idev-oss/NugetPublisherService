@@ -14,16 +14,24 @@ namespace NugetPublisherService.Services
     {
         private const string DateTimeFormat = "O"; // round-trip ISO-8601
 
+        private readonly string _databaseFullPath = ResolveDatabasePath(config.DatabasePath);
         private readonly string _connectionString = BuildConnectionString(config.DatabasePath);
 
-        private static string BuildConnectionString(string databasePath)
+        /// <summary>
+        /// Резолвит путь к файлу БД. Относительный путь считается от каталога приложения
+        /// (рядом с .exe), а НЕ от текущего рабочего каталога: у Windows-службы CWD = C:\Windows\system32.
+        /// </summary>
+        private static string ResolveDatabasePath(string databasePath)
         {
-            // Относительный путь резолвим от каталога приложения (рядом с .exe),
-            // а НЕ от текущего рабочего каталога: у Windows-службы CWD = C:\Windows\system32.
             var fullPath = Path.IsPathRooted(databasePath)
                 ? databasePath
                 : Path.Combine(AppContext.BaseDirectory, databasePath);
-            fullPath = Path.GetFullPath(fullPath);
+            return Path.GetFullPath(fullPath);
+        }
+
+        private static string BuildConnectionString(string databasePath)
+        {
+            var fullPath = ResolveDatabasePath(databasePath);
 
             var directory = Path.GetDirectoryName(fullPath);
             if (!string.IsNullOrEmpty(directory))
@@ -66,8 +74,7 @@ namespace NugetPublisherService.Services
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken);
 
-            var databaseFullPath = Path.GetFullPath(config.DatabasePath);
-            Log.StateStoreInitialized(logger, databaseFullPath);
+            Log.StateStoreInitialized(logger, _databaseFullPath);
         }
 
         /// <summary>
