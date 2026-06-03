@@ -11,9 +11,9 @@ namespace NugetPublisherService.Models
         /// Путь к файлу базы SQLite. Относительный путь разрешается от каталога приложения
         /// (рядом с .exe), а не от текущего рабочего каталога (у службы это C:\Windows\system32).
         /// Можно указать абсолютный путь, например C:\ProgramData\NugetPublisherService\state.db.
-        /// По умолчанию "Data\state.db".
+        /// По умолчанию "state.db" — рядом с исполняемым файлом.
         /// </summary>
         [Required(AllowEmptyStrings = false)]
-        public string DatabasePath { get; set; } = @"Data\state.db";
+        public string DatabasePath { get; set; } = "state.db";
     }
 }
