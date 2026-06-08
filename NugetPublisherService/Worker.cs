@@ -171,7 +171,7 @@ namespace NugetPublisherService
                 .GetCoreV3(packageSource)
                 .GetResourceAsync<PackageUpdateResource>(cancellationToken);
 
-            var timeout = TimeSpan.FromSeconds(30);
+            var timeout = TimeSpan.FromSeconds(settings.GitLab.PushTimeoutSeconds);
 
             // Публикуем пакеты по одному для корректной обработки ошибок.
             foreach (var package in packages)
