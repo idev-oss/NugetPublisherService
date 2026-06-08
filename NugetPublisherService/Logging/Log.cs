@@ -46,6 +46,10 @@ namespace NugetPublisherService.Logging
             Message = "Ошибка при публикации пакета {FileName} после {Attempts} попыток")]
         public static partial void PackagePublishFailed(ILogger logger, string fileName, int attempts, Exception exception);
 
+        [LoggerMessage(EventId = 13, Level = LogLevel.Critical,
+            Message = "Авторизация в GitLab не пройдена (401/403) при публикации {FileName}. Сервис будет остановлен — проверьте токен.")]
+        public static partial void AuthFailureStopping(ILogger logger, string fileName);
+
         // --- Сканер ---
 
         [LoggerMessage(EventId = 20, Level = LogLevel.Information,

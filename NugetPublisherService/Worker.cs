@@ -1,3 +1,4 @@
+using System.Net;
 using NugetPublisherService.Logging;
 using NugetPublisherService.Models;
 using NugetPublisherService.Services;
@@ -13,7 +14,8 @@ namespace NugetPublisherService
         PackageScanner scanner,
         EmailNotifier emailNotifier,
         PackageStateStore stateStore,
-        TimeProvider timeProvider) : BackgroundService
+        TimeProvider timeProvider,
+        IHostApplicationLifetime lifetime) : BackgroundService
     {
         private const int MaxRetryAttempts = 3;
         private static readonly TimeSpan[] RetryDelays =
@@ -22,6 +24,13 @@ namespace NugetPublisherService
             TimeSpan.FromSeconds(15),
             TimeSpan.FromSeconds(30)
         ];
+
+        private enum PushResult
+        {
+            Published,
+            Failed,
+            Unauthorized
+        }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
@@ -42,6 +51,7 @@ namespace NugetPublisherService
                     {
                         Log.NewPackagesFound(logger, newPackages.Count);
 
+                        PackageInfo? authFailure = null;
                         if (settings.DryRun)
                         {
                             foreach (var package in newPackages)
@@ -52,10 +62,22 @@ namespace NugetPublisherService
                         else
                         {
                             var sourceUrl = $"{settings.GitLab.BaseUrl}/projects/{settings.GitLab.ProjectId}/packages/nuget/index.json";
-                            await PushPackagesWithSdkAsync(newPackages, sourceUrl, settings.GitLab.PrivateToken, stoppingToken);
+                            authFailure = await PushPackagesWithSdkAsync(newPackages, sourceUrl, settings.GitLab.PrivateToken, stoppingToken);
                         }
 
                         var processedAt = timeProvider.GetUtcNow().UtcDateTime;
+
+                        // Ошибка авторизации (401/403) — фатальная: ретраи и дальнейшие циклы
+                        // бессмысленны. Уведомляем только администратора и останавливаем сервис.
+                        if (authFailure is not null)
+                        {
+                            await stateStore.RecordFailureAsync(authFailure, authFailure.LastError, processedAt, stoppingToken);
+                            Log.AuthFailureStopping(logger, authFailure.FileName);
+                            await emailNotifier.SendAuthFailureAlertAsync(authFailure, stoppingToken);
+                            lifetime.StopApplication();
+                            return;
+                        }
+
                         foreach (var package in newPackages)
                         {
                             if (package.PublishStatus == PublishStatus.Failed)
@@ -133,7 +155,12 @@ namespace NugetPublisherService
                 : TimeSpan.FromHours(scan.OffHoursIntervalHours);
         }
 
-        private async Task PushPackagesWithSdkAsync(
+        /// <summary>
+        /// Публикует пакеты по одному. Возвращает пакет, на котором произошла ошибка
+        /// авторизации (401/403), либо null, если фатальной ошибки авторизации не было.
+        /// При ошибке авторизации публикация остальных пакетов прекращается.
+        /// </summary>
+        private async Task<PackageInfo?> PushPackagesWithSdkAsync(
             List<PackageInfo> packages, string sourceUrl, string apiKey, CancellationToken cancellationToken)
         {
             var nugetLogger = new NuGetLogger(logger);
@@ -151,14 +178,22 @@ namespace NugetPublisherService
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var published = await PushPackageWithRetryAsync(
+                var result = await PushPackageWithRetryAsync(
                     package, packageUpdateResource, timeout, apiKey, nugetLogger, cancellationToken);
 
-                package.PublishStatus = published ? PublishStatus.Published : PublishStatus.Failed;
+                if (result == PushResult.Unauthorized)
+                {
+                    package.PublishStatus = PublishStatus.Failed;
+                    return package; // токен невалиден — для остальных пакетов результат тот же.
+                }
+
+                package.PublishStatus = result == PushResult.Published ? PublishStatus.Published : PublishStatus.Failed;
             }
+
+            return null;
         }
 
-        private async Task<bool> PushPackageWithRetryAsync(
+        private async Task<PushResult> PushPackageWithRetryAsync(
             PackageInfo package,
             PackageUpdateResource packageUpdateResource,
             TimeSpan timeout,
@@ -185,19 +220,52 @@ namespace NugetPublisherService
 
                     Log.PackagePublished(logger, package.FileName);
                     package.LastError = null;
-                    return true;
-                }
-                catch (Exception ex) when (attempt < MaxRetryAttempts)
-                {
-                    var delay = RetryDelays[attempt];
-                    Log.PackagePublishRetry(logger, package.FileName, attempt + 1, MaxRetryAttempts, delay.TotalSeconds, ex);
-                    await Task.Delay(delay, cancellationToken);
+                    return PushResult.Published;
                 }
                 catch (Exception ex)
                 {
-                    Log.PackagePublishFailed(logger, package.FileName, MaxRetryAttempts + 1, ex);
                     package.LastError = $"{ex.GetType().Name}: {ex.Message}";
-                    return false;
+
+                    // Ошибка авторизации — ретраить бессмысленно, прекращаем сразу.
+                    if (IsAuthError(ex))
+                    {
+                        return PushResult.Unauthorized;
+                    }
+
+                    if (attempt < MaxRetryAttempts)
+                    {
+                        var delay = RetryDelays[attempt];
+                        Log.PackagePublishRetry(logger, package.FileName, attempt + 1, MaxRetryAttempts, delay.TotalSeconds, ex);
+                        await Task.Delay(delay, cancellationToken);
+                        continue;
+                    }
+
+                    Log.PackagePublishFailed(logger, package.FileName, MaxRetryAttempts + 1, ex);
+                    return PushResult.Failed;
+                }
+            }
+
+            return PushResult.Failed;
+        }
+
+        /// <summary>Определяет, является ли исключение ошибкой авторизации (HTTP 401/403).</summary>
+        private static bool IsAuthError(Exception exception)
+        {
+            for (var e = exception; e is not null; e = e.InnerException)
+            {
+                if (e is HttpRequestException http &&
+                    http.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                {
+                    return true;
+                }
+
+                // Fallback на случай, если StatusCode не заполнен.
+                if (e.Message.Contains("(401)", StringComparison.Ordinal) ||
+                    e.Message.Contains("(403)", StringComparison.Ordinal) ||
+                    e.Message.Contains("Unauthorized", StringComparison.OrdinalIgnoreCase) ||
+                    e.Message.Contains("Forbidden", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
                 }
             }
 

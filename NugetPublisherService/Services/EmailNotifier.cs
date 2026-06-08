@@ -37,6 +37,17 @@ namespace NugetPublisherService.Services
             }
         }
 
+        /// <summary>
+        /// Письмо об ошибке авторизации в GitLab (401/403). Отправляется ТОЛЬКО администраторам
+        /// (если Admin не задан — на To). Обычные получатели не уведомляются.
+        /// </summary>
+        public async Task SendAuthFailureAlertAsync(PackageInfo package, CancellationToken cancellationToken = default)
+        {
+            const string subject = "GitLab: ошибка авторизации (401/403) — сервис остановлен";
+            var admins = config.Admin.Length > 0 ? config.Admin : config.To;
+            await SendAsync(admins, subject, BuildAuthAlert(package), cancellationToken);
+        }
+
         private async Task SendAsync(
             string[] recipients, string subject, string htmlBody, CancellationToken cancellationToken)
         {
@@ -145,6 +156,21 @@ namespace NugetPublisherService.Services
             sb.Append("<h2 style='color:#b00;'>Ошибка публикации NuGet пакетов (детали для администратора)</h2>");
             sb.Append(ci, $"<p>Публикация перечисленных пакетов не удалась после {threshold} попыток. Проверьте доступность GitLab и срок действия/права токена (требуется запись в реестр пакетов).</p>");
             AppendPackageList(sb, packages, includeError: true);
+            sb.Append("<p>Это автоматическое уведомление от NugetPublisherService.</p>");
+            sb.Append("</body></html>");
+            return sb.ToString();
+        }
+
+        private static string BuildAuthAlert(PackageInfo package)
+        {
+            var sb = new StringBuilder();
+            sb.Append("<html><body>");
+            sb.Append("<h2 style='color:#b00;'>Ошибка авторизации в GitLab</h2>");
+            sb.Append("<p>Сервис публикации NuGet остановлен: GitLab вернул 401/403 (отказ в доступе). " +
+                      "Дальнейшие попытки публикации бессмысленны до исправления токена.</p>");
+            sb.Append("<p>Проверьте срок действия и права токена (требуется запись в реестр пакетов проекта), " +
+                      "затем запустите службу снова.</p>");
+            AppendPackageList(sb, [package], includeError: true);
             sb.Append("<p>Это автоматическое уведомление от NugetPublisherService.</p>");
             sb.Append("</body></html>");
             return sb.ToString();

@@ -16,6 +16,8 @@ NugetPublisherService is an automated service for publishing NuGet packages to a
 - **Smart scheduling**: Different, configurable scanning intervals for business and non-business hours
 - **Duplicate checking**: Prevention of repeated publications of already existing packages
 - **Email notifications**: Reports with three statuses (Published / Failed / Skipped in DryRun)
+- **Spam-free error alerts**: A publish-failure email is sent once when `FailureAlertThreshold` is reached; administrators (`Smtp.Admin`) get the details, regular recipients are asked to contact the administrator
+- **Authorization failure handling**: On HTTP 401/403 from GitLab the service does not retry uselessly — it notifies only the administrator and shuts down gracefully (restart the service after fixing the token)
 - **Dry Run mode**: Ability to test service operation without actual package publication
 
 ## How It Works
