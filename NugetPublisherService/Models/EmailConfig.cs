@@ -25,5 +25,11 @@ namespace NugetPublisherService.Models
         [Required]
         [MinLength(1, ErrorMessage = "Smtp.To должен содержать хотя бы один email адрес")]
         public required string[] To { get; set; }
+
+        /// <summary>
+        /// Администраторы сервиса. Им отправляются подробности ошибок публикации
+        /// (текст исключения и т.п.). Если список пуст — детали уходят на адреса To.
+        /// </summary>
+        public string[] Admin { get; set; } = [];
     }
 }

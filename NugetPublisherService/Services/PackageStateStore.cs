@@ -66,6 +66,8 @@ namespace NugetPublisherService.Services
                     FileWriteTimeUtc TEXT    NOT NULL,
                     Status           INTEGER NOT NULL,
                     ProcessedAtUtc   TEXT    NOT NULL,
+                    FailureCount     INTEGER NOT NULL DEFAULT 0,
+                    LastError        TEXT    NULL,
                     PRIMARY KEY (PackageId, Version)
                 );
 
@@ -74,7 +76,28 @@ namespace NugetPublisherService.Services
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken);
 
+            // Миграция БД, созданных до появления столбцов FailureCount/LastError.
+            await EnsureColumnAsync(connection, "FailureCount", "INTEGER NOT NULL DEFAULT 0", cancellationToken);
+            await EnsureColumnAsync(connection, "LastError", "TEXT NULL", cancellationToken);
+
             Log.StateStoreInitialized(logger, _databaseFullPath);
+        }
+
+        private static async Task EnsureColumnAsync(
+            SqliteConnection connection, string column, string definition, CancellationToken cancellationToken)
+        {
+            await using var check = connection.CreateCommand();
+            check.CommandText = "SELECT COUNT(*) FROM pragma_table_info('ProcessedPackages') WHERE name = $name;";
+            check.Parameters.AddWithValue("$name", column);
+            var exists = Convert.ToInt64(await check.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture) > 0;
+            if (exists)
+            {
+                return;
+            }
+
+            await using var alter = connection.CreateCommand();
+            alter.CommandText = $"ALTER TABLE ProcessedPackages ADD COLUMN {column} {definition};";
+            await alter.ExecuteNonQueryAsync(cancellationToken);
         }
 
         /// <summary>
@@ -126,7 +149,10 @@ namespace NugetPublisherService.Services
             return result is not null;
         }
 
-        /// <summary>Сохраняет (вставляет или обновляет) запись о результате обработки пакета.</summary>
+        /// <summary>
+        /// Сохраняет успешный результат (Published/Skipped). Счётчик ошибок и текст ошибки
+        /// сбрасываются.
+        /// </summary>
         public async Task SaveAsync(PackageInfo package, DateTime processedAtUtc, CancellationToken cancellationToken)
         {
             await using var connection = new SqliteConnection(_connectionString);
@@ -136,14 +162,16 @@ namespace NugetPublisherService.Services
             command.CommandText =
                 """
                 INSERT INTO ProcessedPackages
-                    (PackageId, Version, FilePath, FileSize, FileWriteTimeUtc, Status, ProcessedAtUtc)
-                VALUES ($id, $version, $path, $size, $time, $status, $processed)
+                    (PackageId, Version, FilePath, FileSize, FileWriteTimeUtc, Status, ProcessedAtUtc, FailureCount, LastError)
+                VALUES ($id, $version, $path, $size, $time, $status, $processed, 0, NULL)
                 ON CONFLICT(PackageId, Version) DO UPDATE SET
                     FilePath         = excluded.FilePath,
                     FileSize         = excluded.FileSize,
                     FileWriteTimeUtc = excluded.FileWriteTimeUtc,
                     Status           = excluded.Status,
-                    ProcessedAtUtc   = excluded.ProcessedAtUtc;
+                    ProcessedAtUtc   = excluded.ProcessedAtUtc,
+                    FailureCount     = 0,
+                    LastError        = NULL;
                 """;
             command.Parameters.AddWithValue("$id", package.PackageId);
             command.Parameters.AddWithValue("$version", package.Version);
@@ -154,6 +182,45 @@ namespace NugetPublisherService.Services
             command.Parameters.AddWithValue("$processed", processedAtUtc.ToString(DateTimeFormat, CultureInfo.InvariantCulture));
 
             await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        /// <summary>
+        /// Фиксирует неудачную попытку публикации: увеличивает накопительный счётчик ошибок,
+        /// сохраняет текст последней ошибки и возвращает новое значение счётчика.
+        /// </summary>
+        public async Task<int> RecordFailureAsync(
+            PackageInfo package, string? error, DateTime processedAtUtc, CancellationToken cancellationToken)
+        {
+            await using var connection = new SqliteConnection(_connectionString);
+            await connection.OpenAsync(cancellationToken);
+
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                """
+                INSERT INTO ProcessedPackages
+                    (PackageId, Version, FilePath, FileSize, FileWriteTimeUtc, Status, ProcessedAtUtc, FailureCount, LastError)
+                VALUES ($id, $version, $path, $size, $time, $status, $processed, 1, $error)
+                ON CONFLICT(PackageId, Version) DO UPDATE SET
+                    FilePath         = excluded.FilePath,
+                    FileSize         = excluded.FileSize,
+                    FileWriteTimeUtc = excluded.FileWriteTimeUtc,
+                    Status           = excluded.Status,
+                    ProcessedAtUtc   = excluded.ProcessedAtUtc,
+                    FailureCount     = ProcessedPackages.FailureCount + 1,
+                    LastError        = excluded.LastError
+                RETURNING FailureCount;
+                """;
+            command.Parameters.AddWithValue("$id", package.PackageId);
+            command.Parameters.AddWithValue("$version", package.Version);
+            command.Parameters.AddWithValue("$path", package.FullPath);
+            command.Parameters.AddWithValue("$size", package.FileSize);
+            command.Parameters.AddWithValue("$time", package.FileWriteTimeUtc.ToString(DateTimeFormat, CultureInfo.InvariantCulture));
+            command.Parameters.AddWithValue("$status", (int)PublishStatus.Failed);
+            command.Parameters.AddWithValue("$processed", processedAtUtc.ToString(DateTimeFormat, CultureInfo.InvariantCulture));
+            command.Parameters.AddWithValue("$error", (object?)error ?? DBNull.Value);
+
+            var result = await command.ExecuteScalarAsync(cancellationToken);
+            return Convert.ToInt32(result, CultureInfo.InvariantCulture);
         }
     }
 }

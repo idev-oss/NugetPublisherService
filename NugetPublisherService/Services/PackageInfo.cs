@@ -26,5 +26,14 @@ namespace NugetPublisherService.Services
         public required long FileSize { get; set; }
         public required DateTime FileWriteTimeUtc { get; set; }
         public PublishStatus PublishStatus { get; set; } = PublishStatus.Pending;
+
+        /// <summary>Текст последней ошибки публикации (для письма администратору).</summary>
+        public string? LastError { get; set; }
+
+        /// <summary>
+        /// Накопительное число неудачных циклов публикации этого пакета (из БД).
+        /// Используется, чтобы слать письмо об ошибке один раз при достижении порога.
+        /// </summary>
+        public int FailureCount { get; set; }
     }
 }

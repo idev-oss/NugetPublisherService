@@ -54,12 +54,14 @@ NugetPublisherService - это автоматизированный сервис
     "Username": "username",
     "Password": "password",
     "From": "sender@example.com",
-    "To": ["recipient1@example.com", "recipient2@example.com"]
+    "To": ["recipient1@example.com", "recipient2@example.com"],
+    "Admin": ["admin@example.com"]          // получатели подробностей об ошибках
   },
   "State": {
-    "DatabasePath": "Data\\state.db"        // файл локального SQLite-кэша
+    "DatabasePath": "state.db"              // файл локального SQLite-кэша (рядом с .exe)
   },
-  "DryRun": false
+  "DryRun": false,
+  "FailureAlertThreshold": 5                 // письмо об ошибке после N неудачных циклов (один раз)
 }
 ```
 

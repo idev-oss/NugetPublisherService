@@ -10,21 +10,52 @@ namespace NugetPublisherService.Services
 {
     public sealed class EmailNotifier(EmailConfig config, ILogger<EmailNotifier> logger)
     {
+        /// <summary>Обычный отчёт об успешно опубликованных/пропущенных пакетах (получателям To).</summary>
         public async Task SendReportAsync(List<PackageInfo> packages, CancellationToken cancellationToken = default)
         {
+            await SendAsync(config.To, BuildSubject(packages), BuildHtmlReport(packages), cancellationToken);
+        }
+
+        /// <summary>
+        /// Письмо об ошибке публикации — отправляется один раз при достижении порога неудач.
+        /// Обычным получателям (To) уходит уведомление без деталей с просьбой обратиться к
+        /// администратору; администраторам (Admin) — те же пакеты плюс технические детали.
+        /// Если Admin не задан, детали уходят на To.
+        /// </summary>
+        public async Task SendFailureAlertAsync(
+            List<PackageInfo> failedPackages, int threshold, CancellationToken cancellationToken = default)
+        {
+            const string subject = "Ошибка публикации NuGet пакетов — требуется вмешательство администратора";
+
+            var admins = config.Admin.Length > 0 ? config.Admin : config.To;
+            await SendAsync(admins, subject, BuildAdminAlert(failedPackages, threshold), cancellationToken);
+
+            // Если администраторы заданы отдельно — обычным получателям шлём версию без деталей.
+            if (config.Admin.Length > 0)
+            {
+                await SendAsync(config.To, subject, BuildUserAlert(failedPackages, threshold), cancellationToken);
+            }
+        }
+
+        private async Task SendAsync(
+            string[] recipients, string subject, string htmlBody, CancellationToken cancellationToken)
+        {
+            if (recipients.Length == 0)
+            {
+                return;
+            }
+
             try
             {
                 var message = new MimeMessage();
                 message.From.Add(MailboxAddress.Parse(config.From));
-                foreach (var to in config.To)
+                foreach (var to in recipients)
                 {
                     message.To.Add(MailboxAddress.Parse(to));
                 }
 
-                message.Subject = BuildSubject(packages);
-
-                var builder = new BodyBuilder { HtmlBody = BuildHtmlReport(packages) };
-                message.Body = builder.ToMessageBody();
+                message.Subject = subject;
+                message.Body = new BodyBuilder { HtmlBody = htmlBody }.ToMessageBody();
 
                 using var smtp = new SmtpClient();
                 await smtp.ConnectAsync(config.Server, config.Port, config.UseSsl, cancellationToken);
@@ -32,8 +63,8 @@ namespace NugetPublisherService.Services
                 await smtp.SendAsync(message, cancellationToken);
                 await smtp.DisconnectAsync(true, cancellationToken);
 
-                var recipients = string.Join(", ", config.To);
-                Log.EmailSent(logger, recipients);
+                var recipientList = string.Join(", ", recipients);
+                Log.EmailSent(logger, recipientList);
             }
             catch (OperationCanceledException)
             {
@@ -48,21 +79,14 @@ namespace NugetPublisherService.Services
         private static string BuildSubject(List<PackageInfo> packages)
         {
             var hasPublished = packages.Any(p => p.PublishStatus == PublishStatus.Published);
-            var hasFailed = packages.Any(p => p.PublishStatus == PublishStatus.Failed);
             var hasSkipped = packages.Any(p => p.PublishStatus == PublishStatus.Skipped);
 
-            if (hasSkipped && !hasPublished && !hasFailed)
+            if (hasSkipped && !hasPublished)
             {
                 return "Новые NuGet пакеты (режим DryRun, публикация не выполнялась)";
             }
 
-            return (hasPublished, hasFailed) switch
-            {
-                (true, true) => "Отчет о публикации NuGet пакетов (есть ошибки)",
-                (true, false) => "Отчет о публикации NuGet пакетов",
-                (false, true) => "Ошибка публикации NuGet пакетов",
-                _ => "Новые NuGet пакеты для публикации"
-            };
+            return "Отчет о публикации NuGet пакетов";
         }
 
         private static string BuildHtmlReport(List<PackageInfo> packages)
@@ -98,6 +122,59 @@ namespace NugetPublisherService.Services
             sb.Append("<p>Это автоматическое уведомление от NugetPublisherService.</p>");
             sb.Append("</body></html>");
             return sb.ToString();
+        }
+
+        private static string BuildUserAlert(List<PackageInfo> packages, int threshold)
+        {
+            var ci = CultureInfo.InvariantCulture;
+            var sb = new StringBuilder();
+            sb.Append("<html><body>");
+            sb.Append("<h2 style='color:#b00;'>Ошибка публикации NuGet пакетов</h2>");
+            sb.Append(ci, $"<p>Не удалось опубликовать перечисленные пакеты после {threshold} попыток. Пожалуйста, обратитесь к администратору сервиса.</p>");
+            AppendPackageList(sb, packages, includeError: false);
+            sb.Append("<p>Это автоматическое уведомление от NugetPublisherService.</p>");
+            sb.Append("</body></html>");
+            return sb.ToString();
+        }
+
+        private static string BuildAdminAlert(List<PackageInfo> packages, int threshold)
+        {
+            var ci = CultureInfo.InvariantCulture;
+            var sb = new StringBuilder();
+            sb.Append("<html><body>");
+            sb.Append("<h2 style='color:#b00;'>Ошибка публикации NuGet пакетов (детали для администратора)</h2>");
+            sb.Append(ci, $"<p>Публикация перечисленных пакетов не удалась после {threshold} попыток. Проверьте доступность GitLab и срок действия/права токена (требуется запись в реестр пакетов).</p>");
+            AppendPackageList(sb, packages, includeError: true);
+            sb.Append("<p>Это автоматическое уведомление от NugetPublisherService.</p>");
+            sb.Append("</body></html>");
+            return sb.ToString();
+        }
+
+        private static void AppendPackageList(StringBuilder sb, List<PackageInfo> packages, bool includeError)
+        {
+            var ci = CultureInfo.InvariantCulture;
+            sb.Append("<table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse;'>");
+            sb.Append("<thead style=\"background:#f0f0f0;\"><tr><th>Имя пакета</th><th>Версия</th><th>Путь</th>");
+            if (includeError)
+            {
+                sb.Append("<th>Ошибка</th>");
+            }
+            sb.Append("</tr></thead><tbody>");
+
+            foreach (var package in packages)
+            {
+                sb.Append("<tr>");
+                sb.Append(ci, $"<td>{HttpUtility.HtmlEncode(package.PackageId)}</td>");
+                sb.Append(ci, $"<td>{HttpUtility.HtmlEncode(package.Version)}</td>");
+                sb.Append(ci, $"<td>{HttpUtility.HtmlEncode(package.FullPath)}</td>");
+                if (includeError)
+                {
+                    sb.Append(ci, $"<td><code>{HttpUtility.HtmlEncode(package.LastError ?? "—")}</code></td>");
+                }
+                sb.Append("</tr>");
+            }
+
+            sb.Append("</tbody></table>");
         }
 
         private static string RenderStatus(PublishStatus status) => status switch

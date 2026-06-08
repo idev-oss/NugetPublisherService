@@ -20,8 +20,16 @@ namespace NugetPublisherService
 
         [Required]
         [ValidateObjectMembers]
-        public StateConfig State { get; set; } = new() { DatabasePath = @"Data\state.db" };
+        public StateConfig State { get; set; } = new() { DatabasePath = "state.db" };
 
         public required bool DryRun { get; set; }
+
+        /// <summary>
+        /// Число неудачных циклов публикации пакета, после которого один раз отправляется
+        /// письмо об ошибке (обычным получателям — «обратитесь к администратору»,
+        /// администраторам — с деталями). По умолчанию 5.
+        /// </summary>
+        [Range(1, 100)]
+        public int FailureAlertThreshold { get; set; } = 5;
     }
 }

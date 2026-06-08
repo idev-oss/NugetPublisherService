@@ -55,12 +55,14 @@ The service is configured through `appsettings.json`. A documented template is a
     "Username": "username",
     "Password": "password",
     "From": "sender@example.com",
-    "To": ["recipient1@example.com", "recipient2@example.com"]
+    "To": ["recipient1@example.com", "recipient2@example.com"],
+    "Admin": ["admin@example.com"]          // recipients of error details
   },
   "State": {
-    "DatabasePath": "Data\\state.db"        // local SQLite cache file
+    "DatabasePath": "state.db"              // local SQLite cache file (next to .exe)
   },
-  "DryRun": false
+  "DryRun": false,
+  "FailureAlertThreshold": 5                 // send error email after N failed cycles (once)
 }
 ```
 

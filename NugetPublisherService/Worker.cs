@@ -55,12 +55,40 @@ namespace NugetPublisherService
                             await PushPackagesWithSdkAsync(newPackages, sourceUrl, settings.GitLab.PrivateToken, stoppingToken);
                         }
 
+                        var processedAt = timeProvider.GetUtcNow().UtcDateTime;
                         foreach (var package in newPackages)
                         {
-                            await stateStore.SaveAsync(package, timeProvider.GetUtcNow().UtcDateTime, stoppingToken);
+                            if (package.PublishStatus == PublishStatus.Failed)
+                            {
+                                // Накопительный счётчик ошибок (для разового алерта по порогу).
+                                package.FailureCount = await stateStore.RecordFailureAsync(
+                                    package, package.LastError, processedAt, stoppingToken);
+                            }
+                            else
+                            {
+                                await stateStore.SaveAsync(package, processedAt, stoppingToken);
+                            }
                         }
 
-                        await emailNotifier.SendReportAsync(newPackages, stoppingToken);
+                        // Обычный отчёт — только по успешно опубликованным/пропущенным пакетам.
+                        var succeeded = newPackages
+                            .Where(p => p.PublishStatus is PublishStatus.Published or PublishStatus.Skipped)
+                            .ToList();
+                        if (succeeded.Count > 0)
+                        {
+                            await emailNotifier.SendReportAsync(succeeded, stoppingToken);
+                        }
+
+                        // Письмо об ошибке — один раз, ровно при достижении порога неудачных попыток.
+                        var alerting = newPackages
+                            .Where(p => p.PublishStatus == PublishStatus.Failed
+                                        && p.FailureCount == settings.FailureAlertThreshold)
+                            .ToList();
+                        if (alerting.Count > 0)
+                        {
+                            await emailNotifier.SendFailureAlertAsync(
+                                alerting, settings.FailureAlertThreshold, stoppingToken);
+                        }
                     }
                     else
                     {
@@ -156,6 +184,7 @@ namespace NugetPublisherService
                         nugetLogger);
 
                     Log.PackagePublished(logger, package.FileName);
+                    package.LastError = null;
                     return true;
                 }
                 catch (Exception ex) when (attempt < MaxRetryAttempts)
@@ -167,6 +196,7 @@ namespace NugetPublisherService
                 catch (Exception ex)
                 {
                     Log.PackagePublishFailed(logger, package.FileName, MaxRetryAttempts + 1, ex);
+                    package.LastError = $"{ex.GetType().Name}: {ex.Message}";
                     return false;
                 }
             }
